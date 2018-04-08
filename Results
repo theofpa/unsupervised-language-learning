@@ -1,0 +1,8 @@
+Spearman - (correlation=0.41414576777339385, pvalue=1.226812869252797e-42), Pearson - (0.4284587, 7.99287568412066e-46), Model - bow2model.zarr, SimLex.zarr
+Spearman - (correlation=0.36739613669787896, pvalue=2.9775781067162087e-33), Pearson - (0.37560058, 8.607488514807563e-35), Model - bow5model.zarr, SimLex.zarr
+Spearman - (correlation=0.44564093493303847, pvalue=7.414295711467646e-50), Pearson - (0.46190137, 6.838845689352232e-54), Model - dep2model.zarr, SimLex.zarr
+
+Spearman - (correlation=0.6997247819107182, pvalue=0.0), Pearson - (0.67753536, 0.0), Model - bow2model.zarr, Men.zarr
+Spearman - (correlation=0.7232639133753112, pvalue=0.0), Pearson - (0.708433, 0.0), Model - bow5model.zarr, Men.zarr
+Spearman - (correlation=0.617616863735196, pvalue=5.58650642e-315), Pearson - (0.59722286, 2.0893385967253157e-289), Model - dep2model.zarr, Men.zarr
+
