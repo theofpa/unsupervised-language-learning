@@ -4,13 +4,12 @@ import zarr
 import xarray
 import numpy
 import logging
-from pprint import pprint
 import time
 import multiprocessing
 from dask.distributed import Client
-from dask.multiprocessing import get
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.stats import spearmanr, pearsonr
+
 logger = logging.getLogger('ULL')
 logging.basicConfig(level=logging.INFO)
 
@@ -38,12 +37,21 @@ class Manager:
     def truth2zarr(file, output):
         with open(file) as f:
             sample1, sample2 , similarities = [], [], []
-            next(f)
-            for line in f:
-                word1, word2, similarity = line.split()[0], line.split()[1], line.split()[2]
-                sample1.append(word1)
-                sample2.append(word2)
-                similarities.append(similarity)
+            if output == 'SimLex.zarr':
+                next(f)
+                for line in f:
+                    word1, word2, similarity = line.split()[0], line.split()[1], line.split()[3]
+                    sample1.append(word1)
+                    sample2.append(word2)
+                    similarities.append(similarity)
+
+            elif output == 'Men.zarr':
+                for line in f:
+                    word1, word2, similarity = line.split()[0], line.split()[1], line.split()[2]
+                    sample1.append(word1)
+                    sample2.append(word2)
+                    similarities.append(similarity)
+
             similarities = numpy.array(similarities, dtype=numpy.float32)
             root = zarr.open(output, mode='w')
             root.create_dataset('similarities', data=similarities)
@@ -102,14 +110,12 @@ class Analyzer:
 
 if __name__ == '__main__':
 
-    client = Client()
-
     tasks = {
-            #'bow2words': (Manager.data2zarr, 'bow2.words', 'bow2model.zarr'),
-            #'bow5words': (Manager.data2zarr, 'bow5.words', 'bow5model.zarr'),
-            #'depswords': (Manager.data2zarr,  'deps.words', 'dep2model.zarr'),
-            #'simlex': (Manager.truth2zarr, 'SimLex-999/SimLex-999.txt', 'SimLex.zarr'),
-            #'men': (Manager.truth2zarr, 'MEN/MEN_dataset_natural_form_full', 'Men.zarr'),
+            'bow2words': (Manager.data2zarr, 'bow2.words', 'bow2model.zarr'),
+            'bow5words': (Manager.data2zarr, 'bow5.words', 'bow5model.zarr'),
+            'depswords': (Manager.data2zarr,  'deps.words', 'dep2model.zarr'),
+            'simlex': (Manager.truth2zarr, 'SimLex-999/SimLex-999.txt', 'SimLex.zarr'),
+            'men': (Manager.truth2zarr, 'MEN/MEN_dataset_natural_form_full', 'Men.zarr'),
             'analyzer': Analyzer(),
             'load_bow2model': (Analyzer.load_train_data, 'analyzer', 'bow2model.zarr'),
             'load_bow5model': (Analyzer.load_train_data, 'analyzer', 'bow5model.zarr'),
@@ -129,8 +135,14 @@ if __name__ == '__main__':
             'men_bow5_stats': (Analyzer.stats, 'analyzer', 'men_bow5_cossim'),
             'men_deps_stats': (Analyzer.stats, 'analyzer', 'men_deps_cossim')
     }
+
     start = time.time()
-    #client.get(tasks, 'men')
+
+    #generate data
+    dask.get(tasks, ['bow2words', 'bow5words', 'depswords', 'simlex', 'men'])
+
+    #calculate statistics
+    client = Client()
     client.get(tasks, ['simlex_bow2_stats', 'simlex_bow5_stats', 'simlex_deps_stats',
                        'men_bow2_stats', 'men_bow5_stats', 'men_deps_stats'])
     end = time.time()
