@@ -478,10 +478,16 @@ class BayesSkipgram(nn.Module):
 
         return out
 
-    def train_network(self, central_data, context_data, labels, epochs, batch_size, weight_decay, lr, momentum, output_dir):
+    def train_network(self, data_dir, epochs, batch_size, weight_decay, lr, momentum, output_dir):
 
         self.cuda()
         self.train(True)
+
+        data = zarr.open(data_dir, 'r')
+
+        central_data = data['train_data_central']
+        context_data = data['train_data_contexts']
+        labels = data['labels']
 
         n_batches = round(central_data.shape[0]/batch_size)
 
@@ -646,27 +652,23 @@ if __name__ == '__main__':
     #featurizer.context_words2features(mode='bayes',
     #                                  output='/home/oem/PycharmProjects/ULLProject2/data.zarr')
 #
-    #m = zarr.open('/home/oem/PycharmProjects/ULLProject2/data.zarr', 'r')
-#
-    #central_words = m['train_data_central']
-    #contexts = m['train_data_contexts']
-    #bay_labels = m['labels']
 #
     #bayes_skipgram = BayesSkipgram(n_layers=3,
     #                  n_features=len(train_corpus.vocabulary),
     #                  corpus=train_corpus,
     #                  embedding_dim=100)
 #
-    #bayes_skipgram.train_network(central_data=central_words,
-    #                       context_data=contexts,
-    #                       labels=bay_labels,
+    #bayes_skipgram.train_network(data_dir='/home/oem/PycharmProjects/ULLProject2/data.zarr',
     #                       epochs=10,
     #                       batch_size=256,
     #                       lr=0.005,
     #                       weight_decay=0.0001,
-    #                       momentum=0.9)
+    #                       momentum=0.9,
+    #                       output_dir='/home/oem/PycharmProjects/ULLProject2')
 #
-    #bayes_skipgram.evaluate(train_corpus, test_corpus)
+    #bayes_skipgram.evaluate(train_corpus=train_corpus,
+    #                        test_corpus=test_corpus,
+    #                        output_dir='/home/oem/PycharmProjects/ULLProject2')
 
 ###################
     end = time.time()
