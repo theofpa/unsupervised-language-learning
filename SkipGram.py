@@ -13,6 +13,9 @@ import zarr
 import scipy.sparse
 from sklearn.metrics.pairwise import cosine_similarity
 from operator import itemgetter
+from pprint import pprint
+from numpy.random import multivariate_normal
+
 
 logger = logging.getLogger('ULL')
 logging.basicConfig(level=logging.INFO)
@@ -34,12 +37,12 @@ class Corpus:
 
 class TrainCorpus(Corpus):
 
-    def __init__(self, files):
+    def __init__(self, files, padding, filter):
 
         Corpus.__init__(self, files)
 
         self._preprocessor = StandardAnalyzer()
-        self._vocabulary = self._build_vocabulary()
+        self._vocabulary = self._build_vocabulary(padding=padding, filter=filter)
         self._n_context_words = None
         self._window_size = None
 
@@ -84,20 +87,29 @@ class TrainCorpus(Corpus):
                 content.append(f.read())
         return content
 
-    def _build_vocabulary(self):
+    def _build_vocabulary(self, padding, filter):
 
         logger.info('Building Vocabulary, Sentences')
 
         words = []
 
         for raw_content in self._content:
-            content = raw_content.split('\n')
             words.extend([token.text for token in self._preprocessor(raw_content, removestops=False)])
 
         vocabulary = {}
+
+        if padding:
+            vocabulary['PAD'] = 0
+        if filter:
+            vocabulary['UNK'] = 1
+
         for word in words:
             if word not in vocabulary:
-                vocabulary[word] = len(vocabulary)
+                if filter:
+                    if len(vocabulary) <= filter:
+                        vocabulary[word] = len(vocabulary)
+                else:
+                    vocabulary[word] = len(vocabulary)
 
         return vocabulary
 
@@ -266,6 +278,33 @@ class Featurizer:
 
                 counter += n_words
 
+        elif mode == 'embed':
+
+            n_sentences = 0
+            max_length = 0
+
+            for sentence in self._train_data.sentences:
+                n_sentences += 1
+                if len(sentence) > max_length:
+                    max_length = len(sentence)
+
+            z = zarr.open(output, 'w')
+            z.create_dataset('lang_data', shape=(n_sentences, max_length), chunks=(256, ), dtype='i')
+
+            counter = 0
+            for sentence in self._train_data.sentences:
+                idx = []
+                for word in sentence:
+                    try:
+                        idx.append(self._train_data[word])
+                    except:
+                        idx.append(self._train_data['UNK'])
+                pad_size = max_length - len(idx)
+                pad = [self._train_data['PAD'] for _ in range(pad_size)]
+                idx += pad
+                z['lang_data'][counter, :] = idx
+                counter += 1
+
 
 class Plotter:
 
@@ -313,7 +352,7 @@ class Skipgram(nn.Module):
 
         return x
 
-    def train_network(self, data_dir, epochs, batch_size, weight_decay, lr, momentum, output_dir):
+    def train_network(self, data_dir, epochs, batch_size, weight_decay, lr, output_dir):
 
         self.cuda()
         self.train(True)
@@ -324,7 +363,7 @@ class Skipgram(nn.Module):
         labels = data['labels']
 
         n_batches = round(train_data.shape[0]/batch_size)
-        opt = optim.SGD(self.parameters(), weight_decay=weight_decay, lr=lr, momentum=momentum)
+        opt = optim.Adam(self.parameters(), weight_decay=weight_decay, lr=lr)
         loss_f = nn.CrossEntropyLoss()
         scheduler = optim.lr_scheduler.StepLR(opt, step_size=5, gamma=0.5)
 
@@ -453,6 +492,9 @@ class BayesSkipgram(nn.Module):
         self.linear3 = nn.Linear(self.embedding_dim, self.embedding_dim)
         self.linear4 = nn.Linear(self.embedding_dim, self.n_embeddings)
 
+        self.embedding3 = nn.Embedding(self.n_embeddings, self.embedding_dim)
+        self.embedding4 = nn.Embedding(self.n_embeddings, self.embedding_dim)
+
     def forward(self, central, contexts, noise):
 
         x = self.embedding1(central)
@@ -474,11 +516,20 @@ class BayesSkipgram(nn.Module):
         z = mu + noise*sigma
 
         out = F.log_softmax(self.linear4(out), dim=1)
-        #out = F.softmax(self.linear4(z), dim=1)
+        out = out.gather(1, contexts).sum(dim=1)
+        out = out.mean()
 
-        return out
+        mu_ = self.embedding3(central)
+        sigma_ = F.softplus(self.embedding4(central))
 
-    def train_network(self, data_dir, epochs, batch_size, weight_decay, lr, momentum, output_dir):
+        kl = torch.log(sigma_) - torch.log(sigma) + 1./2 * (sigma ** 2 + (mu - mu_) ** 2) / sigma_ ** 2 - 1./2
+        kl = kl.sum(dim=1)
+        kl = kl.mean()
+        loss = kl - out
+
+        return loss
+
+    def train_network(self, data_dir, epochs, batch_size, weight_decay, lr, output_dir):
 
         self.cuda()
         self.train(True)
@@ -487,11 +538,10 @@ class BayesSkipgram(nn.Module):
 
         central_data = data['train_data_central']
         context_data = data['train_data_contexts']
-        labels = data['labels']
 
         n_batches = round(central_data.shape[0]/batch_size)
 
-        opt = optim.SGD(self.parameters(), weight_decay=weight_decay, lr=lr, momentum=momentum)
+        opt = optim.Adam(self.parameters(), weight_decay=weight_decay, lr=lr)
         loss_f = nn.KLDivLoss()
         scheduler = optim.lr_scheduler.StepLR(opt, step_size=5, gamma=0.5)
 
@@ -504,23 +554,20 @@ class BayesSkipgram(nn.Module):
             avg_loss = numpy.zeros((1,))
             n_samples = 1
 
-            for idx in range(0, n_batches):
+            for idx in range(n_batches):
 
                 opt.zero_grad()
 
                 central_batch = central_data[idx*batch_size:idx*batch_size+batch_size]
                 context_batch = context_data[idx * batch_size:idx * batch_size + batch_size, :]
-                label_batch = labels[idx*batch_size:idx*batch_size+batch_size]
-                label_batch = self.vocabulary2one_hot(label_batch)
-                noise = torch.randn(1, self.embedding_dim)
 
                 central_batch = Variable(torch.LongTensor(central_batch)).cuda()
                 context_batch = Variable(torch.LongTensor(context_batch)).cuda()
-                noise = Variable(noise, requires_grad=False).cuda()
-                label_batch = Variable(torch.FloatTensor(label_batch), requires_grad=False).cuda()
+                noise = multivariate_normal(numpy.zeros(self.embedding_dim), numpy.eye(self.embedding_dim),
+                                            [central_batch.size()[0]])
+                noise = Variable(torch.FloatTensor(noise), requires_grad=False).cuda()
 
-                output = self(central_batch, context_batch, noise)
-                loss = loss_f(output, label_batch)
+                loss = self(central_batch, context_batch, noise)
                 loss.backward()
                 opt.step()
                 n_samples += 1
@@ -615,61 +662,275 @@ class BayesSkipgram(nn.Module):
         logger.info('Total Average GAP {0}'.format(total_average_gap))
 
 
-if __name__ == '__main__':
+class EmbedAlign(nn.Module):
+
+    def __init__(self, vocab_size1, vocab_size2, emb_dimensions):
+
+        super(EmbedAlign, self).__init__()
+
+        self.embedding_dims = emb_dimensions
+        self.embeddings = nn.Embedding(vocab_size1, emb_dimensions)
+        self.bilstm = nn.LSTM(emb_dimensions, emb_dimensions, bidirectional=True)
+        self.linear0 = nn.Linear(emb_dimensions, emb_dimensions)
+        self.linear1 = nn.Linear(emb_dimensions, emb_dimensions)
+        self.linear2 = nn.Linear(emb_dimensions, emb_dimensions)
+        self.linear3 = nn.Linear(emb_dimensions, emb_dimensions)
+
+        self.linear4 = nn.Linear(emb_dimensions, emb_dimensions)
+        self.linear5 = nn.Linear(emb_dimensions, vocab_size1)
+        self.linear6 = nn.Linear(emb_dimensions, emb_dimensions)
+        self.linear7 = nn.Linear(emb_dimensions, vocab_size2)
+
+    def forward(self, en_batch, fr_batch, noise):
+
+        sent_embeddings = self.embeddings(en_batch)
+        n_batch, n_words, n_dim = sent_embeddings.shape
+
+        o, i = self.bilstm(sent_embeddings.t())
+
+        o = (o[:, :, :self.embedding_dims] + o[:, :, :self.embedding_dims]).t()
+
+        mu = F.relu(self.linear0(o))
+        mu = self.linear1(mu)
+
+        sigma = F.relu(self.linear2(o))
+        sigma = F.softplus(self.linear3(sigma))
+
+        z = mu + noise * sigma
+        mask = torch.sign(en_batch).float()
+
+        x = F.relu(self.linear4(z))
+        x = F.log_softmax(self.linear5(x), dim=-1)
+        x = torch.sum(torch.gather(x, 2, en_batch.view(n_batch, n_words, 1)), dim=1)
+        x = torch.mean(x)
+
+        y = F.relu(self.linear6(z))
+        y = F.log_softmax(self.linear7(y), dim=-1)
+        y = torch.mean(torch.gather(y, 2, fr_batch.expand(n_words, -1, -1).t()), dim=1)
+        y = torch.sum(y, dim=-1)
+        y = torch.mean(y)
+
+        kl = torch.sum(-1./2 * torch.sum(1 + torch.log(sigma**2) - mu**2 - sigma**2, dim=-1), dim=-1)
+        kl = torch.mean(kl)
+
+        loss = -x - y + kl
+
+        return loss
+
+    def train_network(self, eng_dir, fr_dir, epochs, batch_size, weight_decay, lr, output_dir):
+
+        self.cuda()
+        self.train(True)
+
+        opt = optim.Adam(self.parameters(), weight_decay=weight_decay, lr=lr)
+        scheduler = optim.lr_scheduler.StepLR(opt, step_size=5, gamma=0.5)
+
+        losses = []
+
+        z1 = zarr.open(eng_dir, 'r')
+        eng = z1['lang_data']
+
+        z2 = zarr.open(fr_dir, 'r')
+        fr = z2['lang_data']
+
+        n_batches = round(len(eng) / batch_size)
+
+        for epoch in range(epochs):
+
+            start = time.time()
+            scheduler.step()
+            avg_loss = numpy.zeros((1,))
+            n_samples = 1
+
+            for idx in range(n_batches):
+
+                opt.zero_grad()
+
+                eng_batch = eng[idx*batch_size:idx*batch_size+batch_size, :]
+                fr_batch = fr[idx*batch_size:idx*batch_size+batch_size, :]
+
+                eng_batch = Variable(torch.LongTensor(eng_batch)).cuda()
+                fr_batch = Variable(torch.LongTensor(fr_batch)).cuda()
+                noise = multivariate_normal(numpy.zeros(self.embedding_dims), numpy.eye(self.embedding_dims),
+                                            [eng_batch.size()[0], eng_batch.size()[1]])
+                noise = Variable(torch.FloatTensor(noise), requires_grad=False).cuda()
+
+                loss = self(eng_batch, fr_batch, noise)
+                loss.backward()
+                opt.step()
+                n_samples += 1
+                avg_loss += loss.cpu().data.numpy()
+
+            end = time.time()
+            avg_loss /= n_samples
+            losses.append(avg_loss)
+            logger.info('Epoch {0}, Average Loss {1}, Minutes spent {2}'
+                    .format(epoch + 1, round(avg_loss.data[0], 4), round((end-start)/60., 2)))
+
+        Plotter.plot_training(epochs=epochs,
+                              losses=losses,
+                              embedding_dim=self.embedding_dims,
+                              output=output_dir)
+
+    def evaluate(self, train_corpus, test_corpus, output_dir):
+
+        self.train(False)
+
+        embeddings = list(self.parameters())[0]
+
+        candidates = test_corpus.candidates
+        truth = test_corpus.ground_truth
+        ranked = {}
+
+        for target, candidate in candidates.items():
+            try:
+                idx = train_corpus[target]
+                target_vec = embeddings[idx, :].cpu().data.numpy()
+            except:
+                logger.warning('Target out of Vocabulary {0}'.format(target))
+            else:
+                ranking = []
+                for phrase in candidate:
+                    n_words = 0
+                    phrase_vec = torch.FloatTensor([0 for _ in range(self.embedding_dims)])
+                    for word in phrase:
+                        try:
+                            idx = train_corpus[word]
+                        except:
+                            logger.warning('Candidate out of Vocabulary {0}'.format(word))
+                        else:
+                            n_words += 1
+                            phrase_vec += embeddings[idx, :].cpu().data
+
+                    if n_words:
+                        phrase_vec /= len(phrase)
+
+                    phrase_vec = phrase_vec.numpy()
+                    sim = cosine_similarity(target_vec.reshape(1, -1), phrase_vec.reshape(1, -1))[0][0]
+                    ranking.append(tuple([phrase, sim]))
+                ranking = sorted(ranking, key=itemgetter(1), reverse=True)
+                ranking = [i[0] for i in ranking]
+                ranked[target] = ranking
+
+        total_average_gap = 0
+        counter = 1
+        gaps = []
+
+        for target, sentences in truth.items():
+            try:
+                ranking = ranked[target]
+            except:
+                pass
+            else:
+                for sentence in sentences:
+                    total_weight = sum([int(i[1]) for i in sentence])
+                    tokens = [i[0] for i in sentence]
+                    found = 1
+                    precision_at = 0
+                    for idx in range(len(ranking)):
+                        if ranking[idx] in tokens:
+                            precision_at += found / (idx + 1)
+                            found += 1
+                    gap = precision_at / total_weight
+                    gaps.append(gap)
+                    total_average_gap += gap
+                    counter += 1
+
+        Plotter.plot_evaluation(scores=gaps,
+                                n_sentences=len(gaps),
+                                output=output_dir)
+
+        total_average_gap /= counter
+        logger.info('Total Average GAP {0}'.format(total_average_gap))
+
+
+def run(model, output_dir, epochs, emb_dimensions, lr, batch_size, weight_decay):
 
     start = time.time()
-    train_corpus = TrainCorpus(files=['hansards/training.en'])
 
-    test_corpus = TestCorpus(candidate_file='eval/lst.gold.candidates',
-                             truth_file='eval/lst_test.gold')
+    if model == 'embed':
 
+        eng_corpus = TrainCorpus(files=['hansards/training.en'], padding=True, filter=10000)
+        fr_corpus = TrainCorpus(files=['hansards/training.fr'], padding=True, filter=10000)
+        test_corpus = TestCorpus(candidate_file='eval/lst.gold.candidates',
+                                 truth_file='eval/lst_test.gold')
+        e_featurizer = Featurizer(eng_corpus, test_corpus)
+        f_featurizer = Featurizer(fr_corpus, test_corpus)
+        e_featurizer.context_words2features(mode='embed',
+                                            output=output_dir + '/' + 'e_data.zarr')
+        f_featurizer.context_words2features(mode='embed',
+                                            output=output_dir + '/' + 'f_data.zarr')
+        embed_align = EmbedAlign(vocab_size1=len(eng_corpus.vocabulary),
+                                 vocab_size2=len(fr_corpus.vocabulary),
+                                 emb_dimensions=emb_dimensions)
+        embed_align.train_network(eng_dir=output_dir + '/' + 'e_data.zarr',
+                                  fr_dir=output_dir + '/' + 'f_data.zarr',
+                                  epochs=epochs,
+                                  batch_size=batch_size,
+                                  lr=lr,
+                                  weight_decay=weight_decay,
+                                  output_dir=output_dir)
+        embed_align.evaluate(train_corpus=eng_corpus,
+                             test_corpus=test_corpus,
+                             output_dir=output_dir)
 
-    featurizer = Featurizer(train_corpus, test_corpus)
+    elif model == 'skipgram':
 
-###################
+        train_corpus = TrainCorpus(files=['hansards/training.en'], padding=True, filter=None)
+        test_corpus = TestCorpus(candidate_file='eval/lst.gold.candidates',
+                                 truth_file='eval/lst_test.gold')
+        featurizer = Featurizer(train_corpus, test_corpus)
+        featurizer.context_words2features(mode='normal',
+                                          output=output_dir + '/' + 'data.zarr')
+        skipgram = Skipgram(n_layers=3,
+                            n_hidden=emb_dimensions,
+                            n_features=len(train_corpus.vocabulary))
+        skipgram.train_network(data_dir=output_dir + '/' + 'data.zarr',
+                               epochs=epochs,
+                               batch_size=batch_size,
+                               weight_decay=weight_decay,
+                               lr=lr,
+                               output_dir=output_dir)
+        skipgram.evaluate(train_corpus=train_corpus,
+                          test_corpus=test_corpus,
+                          output_dir=output_dir)
 
-    featurizer.context_words2features(mode='normal',
-                                      output='/home/oem/PycharmProjects/ULLProject2/data.zarr')
+    elif model == 'bayes':
 
-    skipgram = Skipgram(n_layers=3,
-                      n_hidden=100,
-                      n_features = len(train_corpus.vocabulary))
+        train_corpus = TrainCorpus(files=['hansards/training.en'], padding=True, filter=None)
+        test_corpus = TestCorpus(candidate_file='eval/lst.gold.candidates',
+                                 truth_file='eval/lst_test.gold')
+        featurizer = Featurizer(train_corpus, test_corpus)
+        featurizer.context_words2features(mode='bayes',
+                                          output=output_dir + '/' + 'data.zarr')
+        bayes_skipgram = BayesSkipgram(n_layers=3,
+                                       n_features=len(train_corpus.vocabulary),
+                                       corpus=train_corpus,
+                                       embedding_dim=emb_dimensions)
+        bayes_skipgram.train_network(data_dir=output_dir + '/' + 'data.zarr',
+                                     epochs=epochs,
+                                     batch_size=batch_size,
+                                     lr=lr,
+                                     weight_decay=weight_decay,
+                                     output_dir=output_dir)
+        bayes_skipgram.evaluate(train_corpus=train_corpus,
+                                test_corpus=test_corpus,
+                                output_dir=output_dir)
 
-    skipgram.train_network(data_dir='/home/oem/PycharmProjects/ULLProject2/data.zarr',
-                          epochs=10,
-                          batch_size=256,
-                          weight_decay=0.0001,
-                          lr=0.005,
-                          momentum=0.9,
-                          output_dir='/home/oem/PycharmProjects/ULLProject2')
+    else:
+        raise NotImplementedError
 
-    skipgram.evaluate(train_corpus=train_corpus,
-                      test_corpus=test_corpus,
-                      output_dir='/home/oem/PycharmProjects/ULLProject2')
-
-###################
-
-    #featurizer.context_words2features(mode='bayes',
-    #                                  output='/home/oem/PycharmProjects/ULLProject2/data.zarr')
-#
-#
-    #bayes_skipgram = BayesSkipgram(n_layers=3,
-    #                  n_features=len(train_corpus.vocabulary),
-    #                  corpus=train_corpus,
-    #                  embedding_dim=100)
-#
-    #bayes_skipgram.train_network(data_dir='/home/oem/PycharmProjects/ULLProject2/data.zarr',
-    #                       epochs=10,
-    #                       batch_size=256,
-    #                       lr=0.005,
-    #                       weight_decay=0.0001,
-    #                       momentum=0.9,
-    #                       output_dir='/home/oem/PycharmProjects/ULLProject2')
-#
-    #bayes_skipgram.evaluate(train_corpus=train_corpus,
-    #                        test_corpus=test_corpus,
-    #                        output_dir='/home/oem/PycharmProjects/ULLProject2')
-
-###################
     end = time.time()
-    logger.info('Finished Run, Time Elapsed {0} Minutes'.format(round((end-start)/60, 2)))
+    logger.info('Finished Run, Time Elapsed {0} Minutes'.format(round((end - start) / 60, 2)))
+
+
+if __name__ == '__main__':
+
+    #skipgram, bayes, embed
+    run(model='skipgram',
+        output_dir='/home/oem/PycharmProjects/ULLProject2',
+        epochs=10,
+        emb_dimensions=300,
+        lr=0.005,
+        batch_size=256,
+        weight_decay=0.0001)
