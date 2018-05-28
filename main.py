@@ -52,8 +52,8 @@ def batcher(params, batch):
 if __name__ == "__main__":
 
     params_senteval.task_path = ''
-    params_senteval.tok_path = 'embeddings.npy'
-    params_senteval.emb_path = 'tokenizer.pickle'
+    params_senteval.tok_path = 'tokenizer.pickle'
+    params_senteval.emb_path = 'embeddings.npy'
     params_senteval.kfold = 10
     se = senteval.engine.SE(params_senteval, batcher, prepare)
 
