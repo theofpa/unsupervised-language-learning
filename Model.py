@@ -91,11 +91,10 @@ class TrainCorpus(Corpus):
             words.extend([token.text for token in self._preprocessor(raw_content, removestops=False)])
 
         vocabulary = {}
-
+        vocabulary['UNK'] = 0
+        
         if padding:
-            vocabulary['PAD'] = 0
-        if filter:
-            vocabulary['UNK'] = 1
+            vocabulary['PAD'] = 1    
 
         for word in words:
             if word not in vocabulary:
