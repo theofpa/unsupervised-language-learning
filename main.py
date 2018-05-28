@@ -37,7 +37,7 @@ def batcher(params, batch):
     embeddings = []
     for sent in batch:
 
-        x1 = [params.tokenizer[word] for word in sent]
+        x1 = [params.tokenizer[word] if word in params.tokenizer[word] else params.tokenizer['UNK'] for word in sent]
         z_batch1 = params.embeddings[x1, :]
         sent_vec = np.mean(z_batch1, axis=0)
 
